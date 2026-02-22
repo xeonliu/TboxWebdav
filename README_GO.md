@@ -20,7 +20,7 @@
 
 ## 程序简介
 
-程序对接了新交大云盘（腾讯 SMH）API 和 WebDAV 协议，用户可以通过 WebDAV 协议访问新交大云盘，借助 RaiDrive 等工具可将新交大云盘挂载为网络磁盘，与系统文件管理器深度整合，使用体验接近本地磁盘。
+程序对接了新交大云盘（腾讯 SMH）API 和 WebDAV / FTP 协议，用户可以通过 WebDAV 或 FTP 协议访问新交大云盘，借助 RaiDrive 等工具可将新交大云盘挂载为网络磁盘，与系统文件管理器深度整合，使用体验接近本地磁盘。
 
 ---
 
@@ -124,16 +124,16 @@ Flags:
   -p, --port <port>                 HTTP 服务监听端口。 [默认: 65472]
       --host <host>                 HTTP 服务监听主机名或 IP 地址。 [默认: localhost]
       --cachesize <bytes>           缓存空间大小（字节，建议不低于 10MB）。 [默认: 20971520]
-      --auth <mode>                 WebDAV 认证方式：None | JaCookie | UserToken | Custom | Mixed
+      --auth <mode>                 WebDAV/FTP 认证方式：None | JaCookie | UserToken | Custom | Mixed
                                       None      — 匿名认证，需同时指定 --cookie 或 --token。
-                                      JaCookie  — 以 JAAuthCookie 作为 WebDAV 密码进行认证。
-                                      UserToken — 以 UserToken 作为 WebDAV 密码进行认证。
+                                      JaCookie  — 以 JAAuthCookie 作为密码进行认证。
+                                      UserToken — 以 UserToken 作为密码进行认证。
                                       Custom    — 自定义用户名/密码，需配合 --username/--password
                                                   或配置文件使用。
                                       Mixed     — 混合模式，同时支持 JaCookie、UserToken 和
                                                   Custom 三种方式（推荐）。 [默认: Mixed]
-  -U, --username <username>         自定义 WebDAV 认证用户名（仅 Custom/Mixed 模式有效）。
-  -P, --password <password>         自定义 WebDAV 认证密码（仅 Custom/Mixed 模式有效）。
+  -U, --username <username>         自定义认证用户名（仅 Custom/Mixed 模式有效）。
+  -P, --password <password>         自定义认证密码（仅 Custom/Mixed 模式有效）。
   -C, --cookie <cookie>             JAAuthCookie 字符串。
   -T, --token <token>               新云盘 UserToken 字符串。
       --access <mode>               访问权限：Full | ReadOnly | NoDelete [默认: Full]
@@ -141,6 +141,11 @@ Flags:
                                       ReadOnly  — 只读，禁止写入和删除。
                                       NoDelete  — 允许读写，禁止删除。
       --log-level <level>           日志级别：debug | info | warn | error [默认: info]
+      --ftp                         启用 FTP 服务器（与 WebDAV 服务同时运行）。
+      --ftp-port <port>             FTP 服务监听端口。 [默认: 2121]
+      --ftp-passive-host <ip>       FTP PASV 模式对外公布的 IP 地址（公网部署时需设置）。
+      --ftp-passive-port-start <n>  FTP 被动模式端口范围起始值（0 表示随机）。
+      --ftp-passive-port-end <n>    FTP 被动模式端口范围终止值。
   -h, --help                        显示帮助信息
 ```
 
@@ -151,15 +156,22 @@ Flags:
 使用 `-c config.yaml` 指定配置文件时，所有命令行参数失效，以配置文件为准。
 
 ```yaml
-Host: 0.0.0.0          # HTTP 服务监听主机，默认 localhost
-Port: 65472            # HTTP 服务监听端口，默认 65472
+Host: 0.0.0.0          # HTTP/FTP 服务监听主机，默认 localhost
+Port: 65472            # WebDAV HTTP 服务监听端口，默认 65472
 CacheSize: 20971520    # 目录缓存大小（字节），默认 20MB
 AuthMode: Mixed        # 认证模式，默认 Mixed
 AccessMode: Full       # 访问模式，默认 Full
 Cookie: ""             # JAAuthCookie（可选）
 UserToken: ""          # UserToken（可选）
 
-# 自定义用户列表（Custom / Mixed 模式下生效）
+# FTP 服务设置（可选）
+FTPEnabled: true       # 是否启用 FTP 服务，默认 false
+FTPPort: 2121          # FTP 服务监听端口，默认 2121
+FTPPassiveHost: ""     # PASV 对外公布的 IP（公网部署时填写公网 IP）
+FTPPassivePortStart: 50000  # PASV 端口范围起始（0 = 随机）
+FTPPassivePortEnd:   51000  # PASV 端口范围终止
+
+# 自定义用户列表（Custom / Mixed 模式下生效，WebDAV 和 FTP 共用）
 Users:
   - UserName: alice
     Password: mypassword
@@ -170,7 +182,7 @@ Users:
     AccessMode: ReadOnly            # 该用户仅有只读权限
 ```
 
-> **说明**：`Users` 列表中每个用户可单独设置 `AccessMode`，未设置则继承全局 `AccessMode`。
+> **说明**：`Users` 列表中每个用户可单独设置 `AccessMode`，未设置则继承全局 `AccessMode`。FTP 与 WebDAV 共享同一套认证配置，认证方式与密码格式完全相同。
 
 ---
 
@@ -211,6 +223,7 @@ CI 构建由 [`.github/workflows/release_go.yml`](.github/workflows/release_go.y
 | 配置文件 | YAML，字段名相同 | YAML，字段名相同 |
 | 日志 | ASP.NET Core 内置日志 | 结构化日志（`log/slog`），支持 `--log-level` |
 | 目录缓存 | 无 | **30 秒 TTL，变更时自动失效** |
+| FTP 支持 | 无 | **支持，通过 `--ftp` 启用** |
 
 ---
 

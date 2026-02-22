@@ -8,25 +8,32 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	ftpserver "github.com/fclairamb/ftpserverlib"
 	"github.com/xeonliu/TboxWebdav/internal/auth"
 	"github.com/xeonliu/TboxWebdav/internal/config"
+	ftphandler "github.com/xeonliu/TboxWebdav/internal/ftp"
 	"github.com/xeonliu/TboxWebdav/internal/tbox"
 	davhandler "github.com/xeonliu/TboxWebdav/internal/webdav"
 )
 
 func main() {
 	var (
-		configFile string
-		port       int
-		host       string
-		cacheSize  int
-		authMode   string
-		username   string
-		password   string
-		cookie     string
-		token      string
-		accessMode string
-		logLevel   string
+		configFile          string
+		port                int
+		host                string
+		cacheSize           int
+		authMode            string
+		username            string
+		password            string
+		cookie              string
+		token               string
+		accessMode          string
+		logLevel            string
+		ftpEnabled          bool
+		ftpPort             int
+		ftpPassiveHost      string
+		ftpPassivePortStart int
+		ftpPassivePortEnd   int
 	)
 
 	root := &cobra.Command{
@@ -65,6 +72,12 @@ func main() {
 					AccessMode: ac,
 					Cookie:     cookie,
 					UserToken:  token,
+
+					FTPEnabled:          ftpEnabled,
+					FTPPort:             ftpPort,
+					FTPPassiveHost:      ftpPassiveHost,
+					FTPPassivePortStart: ftpPassivePortStart,
+					FTPPassivePortEnd:   ftpPassivePortEnd,
 				}
 
 				// If a username is provided on CLI, add it as a custom user.
@@ -105,6 +118,11 @@ func main() {
 	root.Flags().StringVarP(&token, "token", "T", "", "UserToken for Tbox auth")
 	root.Flags().StringVar(&accessMode, "access", "Full", "Access mode: Full, ReadOnly, NoDelete")
 	root.Flags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
+	root.Flags().BoolVar(&ftpEnabled, "ftp", false, "Enable FTP server")
+	root.Flags().IntVar(&ftpPort, "ftp-port", 2121, "FTP listening port")
+	root.Flags().StringVar(&ftpPassiveHost, "ftp-passive-host", "", "Public IP for FTP PASV mode")
+	root.Flags().IntVar(&ftpPassivePortStart, "ftp-passive-port-start", 0, "Start of FTP passive port range (0 = random)")
+	root.Flags().IntVar(&ftpPassivePortEnd, "ftp-passive-port-end", 0, "End of FTP passive port range")
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -137,6 +155,22 @@ func runServer(cfg *config.Config) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", auth.Middleware(cfg, davHandler))
+
+	// Start FTP server in background if enabled.
+	if cfg.FTPEnabled {
+		if cfg.FTPPort == 0 {
+			cfg.FTPPort = 2121
+		}
+		driver := ftphandler.NewDriver(client, cfg)
+		ftpSrv := ftpserver.NewFtpServer(driver)
+		ftpAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.FTPPort)
+		slog.Info("TboxWebdav FTP server started", "addr", "ftp://"+ftpAddr)
+		go func() {
+			if err := ftpSrv.ListenAndServe(); err != nil {
+				slog.Error("FTP server stopped", "error", err)
+			}
+		}()
+	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	slog.Info("TboxWebdav server started", "addr", "http://"+addr, "auth", cfg.AuthMode, "access", cfg.AccessMode)

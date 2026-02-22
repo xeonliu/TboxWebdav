@@ -68,7 +68,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 
 		// UserToken mode / Mixed: accept 128-char hex strings as UserToken.
 		if cfg.AuthMode == config.AuthModeUserToken || cfg.AuthMode == config.AuthModeMixed {
-			if isValidUserToken(password) {
+			if IsValidUserToken(password) {
 				slog.Debug("auth: accepted as UserToken", "username", username)
 				ctx := withCreds(r.Context(), password, "", cfg.AccessMode)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -78,7 +78,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 
 		// JaCookie mode / Mixed: accept base64-decodable strings as JaCookie.
 		if cfg.AuthMode == config.AuthModeJaCookie || cfg.AuthMode == config.AuthModeMixed {
-			if isValidJaCookie(password) {
+			if IsValidJaCookie(password) {
 				slog.Debug("auth: accepted as JaCookie", "username", username)
 				ctx := withCreds(r.Context(), "", password, cfg.AccessMode)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -121,8 +121,8 @@ func sendUnauthorized(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusUnauthorized)
 }
 
-// isValidUserToken returns true if the string is exactly 128 hex characters.
-func isValidUserToken(s string) bool {
+// IsValidUserToken returns true if the string is exactly 128 hex characters.
+func IsValidUserToken(s string) bool {
 	if len(s) != 128 {
 		return false
 	}
@@ -134,8 +134,8 @@ func isValidUserToken(s string) bool {
 	return true
 }
 
-// isValidJaCookie returns true if the string is valid base64.
-func isValidJaCookie(s string) bool {
+// IsValidJaCookie returns true if the string is valid base64.
+func IsValidJaCookie(s string) bool {
 	_, err := base64.StdEncoding.DecodeString(s)
 	return err == nil
 }
