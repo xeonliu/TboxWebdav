@@ -1,6 +1,9 @@
 package tbox
 
 import (
+	"path"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -120,4 +123,111 @@ var (
 	GlobalCredCache  = NewCredCache()
 	GlobalTokenCache = NewTokenCache()
 	GlobalQuotaCache = NewQuotaCache()
+	GlobalDirCache   = NewDirCache()
 )
+
+// --------------------------------------------------------------------------
+// DirCache — caches GetItemInfo and ListItems results
+// --------------------------------------------------------------------------
+
+// dirCacheTTL is the TTL for directory listing and item-info cache entries.
+// After this duration entries are considered stale and re-fetched from the API.
+const dirCacheTTL = 30 * time.Second
+
+// itemInfoEntry is a cache slot for a single MergedItemDto.
+type itemInfoEntry struct {
+	item    *MergedItemDto
+	expires time.Time
+}
+
+// dirListEntry is a cache slot for one page of a directory listing.
+type dirListEntry struct {
+	list    *ItemListDto
+	expires time.Time
+}
+
+// DirCache caches GetItemInfo and ListItems API results with a short TTL and
+// supports path-based invalidation for mutation operations (PUT/DELETE/MKCOL/COPY/MOVE).
+type DirCache struct {
+	mu       sync.RWMutex
+	itemInfo map[string]*itemInfoEntry
+	dirLists map[string]*dirListEntry
+}
+
+// NewDirCache creates an empty DirCache.
+func NewDirCache() *DirCache {
+	return &DirCache{
+		itemInfo: make(map[string]*itemInfoEntry),
+		dirLists: make(map[string]*dirListEntry),
+	}
+}
+
+// GetItemInfo returns the cached MergedItemDto for path, or nil if absent/expired.
+func (c *DirCache) GetItemInfo(p string) *MergedItemDto {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.itemInfo[p]
+	if !ok || time.Now().After(e.expires) {
+		return nil
+	}
+	return e.item
+}
+
+// SetItemInfo stores item in the cache under path.
+func (c *DirCache) SetItemInfo(p string, item *MergedItemDto) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.itemInfo[p] = &itemInfoEntry{item: item, expires: time.Now().Add(dirCacheTTL)}
+}
+
+// listKey returns the map key for a directory listing page.
+func listKey(p string, page, pageSize int) string {
+	return p + "\x00" + strconv.Itoa(page) + "\x00" + strconv.Itoa(pageSize)
+}
+
+// GetDirList returns a cached ItemListDto, or nil if absent/expired.
+func (c *DirCache) GetDirList(p string, page, pageSize int) *ItemListDto {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.dirLists[listKey(p, page, pageSize)]
+	if !ok || time.Now().After(e.expires) {
+		return nil
+	}
+	return e.list
+}
+
+// SetDirList stores list in the cache under (path, page, pageSize).
+func (c *DirCache) SetDirList(p string, page, pageSize int, list *ItemListDto) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dirLists[listKey(p, page, pageSize)] = &dirListEntry{list: list, expires: time.Now().Add(dirCacheTTL)}
+}
+
+// Invalidate removes all cached entries for the given path and its parent
+// directory. Call this after any successful mutation.
+func (c *DirCache) Invalidate(p string) {
+	parent := path.Dir(p)
+	// Guard against path.Dir("") == "." edge case.
+	if parent == "." {
+		parent = "/"
+	}
+
+	// Listing prefix for a directory: all keys beginning with "dir\x00page\x00size"
+	// share the directory path as prefix up to the first \x00.
+	listPrefixPath := p + "\x00"
+	listPrefixParent := parent + "\x00"
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Remove exact item info entries.
+	delete(c.itemInfo, p)
+	delete(c.itemInfo, parent)
+
+	// Remove all dir-list pages for path and parent.
+	for key := range c.dirLists {
+		if strings.HasPrefix(key, listPrefixPath) || strings.HasPrefix(key, listPrefixParent) {
+			delete(c.dirLists, key)
+		}
+	}
+}

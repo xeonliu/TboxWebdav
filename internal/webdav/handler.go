@@ -28,6 +28,7 @@ type Handler struct {
 	credCache  *tbox.CredCache
 	tokenCache *tbox.TokenCache
 	quotaCache *tbox.QuotaCache
+	dirCache   *tbox.DirCache
 	lockSystem webdav.LockSystem
 }
 
@@ -38,6 +39,7 @@ func NewHandler(client *tbox.Client) *Handler {
 		credCache:  tbox.GlobalCredCache,
 		tokenCache: tbox.GlobalTokenCache,
 		quotaCache: tbox.GlobalQuotaCache,
+		dirCache:   tbox.GlobalDirCache,
 		lockSystem: webdav.NewMemLS(),
 	}
 }
@@ -147,6 +149,34 @@ func (h *Handler) resolveCred(userToken string) (*tbox.SpaceCred, error) {
 	return cred, nil
 }
 
+// getItemInfo returns metadata for path, using the DirCache to avoid redundant API calls.
+func (h *Handler) getItemInfo(cred *tbox.SpaceCred, p string) (*tbox.MergedItemDto, error) {
+	if cached := h.dirCache.GetItemInfo(p); cached != nil {
+		slog.Debug("dirCache: item info hit", "path", p)
+		return cached, nil
+	}
+	info, err := h.client.GetItemInfo(cred, p)
+	if err != nil {
+		return nil, err
+	}
+	h.dirCache.SetItemInfo(p, info)
+	return info, nil
+}
+
+// listItems returns one page of a directory listing, using the DirCache.
+func (h *Handler) listItems(cred *tbox.SpaceCred, p string, page, pageSize int) (*tbox.ItemListDto, error) {
+	if cached := h.dirCache.GetDirList(p, page, pageSize); cached != nil {
+		slog.Debug("dirCache: dir list hit", "path", p, "page", page)
+		return cached, nil
+	}
+	list, err := h.client.ListItems(cred, p, page, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	h.dirCache.SetDirList(p, page, pageSize, list)
+	return list, nil
+}
+
 // accessMode extracts the AccessMode from the request context.
 func accessMode(r *http.Request) config.AccessMode {
 	if am, ok := r.Context().Value(auth.ContextKeyAccessMode).(config.AccessMode); ok {
@@ -213,7 +243,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, headOnly boo
 	path := requestPath(r)
 
 	// Stat to confirm the file exists and to get its metadata.
-	info, err := h.client.GetItemInfo(cred, path)
+	info, err := h.getItemInfo(cred, path)
 	if err != nil {
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
@@ -312,6 +342,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Upload failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	h.dirCache.Invalidate(path)
 	slog.Info("PUT: upload completed", "path", path)
 	w.WriteHeader(http.StatusCreated)
 }
@@ -409,6 +440,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Delete failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	h.dirCache.Invalidate(path)
 	slog.Info("DELETE: succeeded", "path", path)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -440,6 +472,7 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "MKCOL failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	h.dirCache.Invalidate(path)
 	slog.Info("MKCOL: created", "path", path)
 	w.WriteHeader(http.StatusCreated)
 }
@@ -491,6 +524,8 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, isMove 
 		http.Error(w, "Operation failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	h.dirCache.Invalidate(src)
+	h.dirCache.Invalidate(dst)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -543,7 +578,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 		// Root is a virtual collection.
 		entries = append(entries, propfindEntry{path: "/", isRoot: true})
 	} else {
-		info, err := h.client.GetItemInfo(cred, path)
+		info, err := h.getItemInfo(cred, path)
 		if err != nil {
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
@@ -569,7 +604,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 			const pageSize = 100
 			for {
 				slog.Debug("PROPFIND: listing directory", "path", parentPath, "page", page)
-				list, err := h.client.ListItems(cred, parentPath, page, pageSize)
+				list, err := h.listItems(cred, parentPath, page, pageSize)
 				if err != nil {
 					slog.Error("PROPFIND: ListItems failed", "path", parentPath, "page", page, "error", err)
 					break
