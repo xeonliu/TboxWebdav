@@ -240,7 +240,9 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, headOnly boo
 		return
 	}
 	defer body.Close()
-	io.Copy(w, body)
+	if _, err := io.Copy(w, body); err != nil {
+		log.Printf("serveFile copy error: %v", err)
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -545,12 +547,23 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(207)
 
-	w.Write([]byte(xml.Header))
-	w.Write([]byte(`<D:multistatus xmlns:D="DAV:">`))
-	for _, e := range entries {
-		w.Write(buildPropfindResponse(e.path, e.item, e.isRoot, quota))
+	if _, err := w.Write([]byte(xml.Header)); err != nil {
+		log.Printf("PROPFIND write error: %v", err)
+		return
 	}
-	w.Write([]byte(`</D:multistatus>`))
+	if _, err := w.Write([]byte(`<D:multistatus xmlns:D="DAV:">`)); err != nil {
+		log.Printf("PROPFIND write error: %v", err)
+		return
+	}
+	for _, e := range entries {
+		if _, err := w.Write(buildPropfindResponse(e.path, e.item, e.isRoot, quota)); err != nil {
+			log.Printf("PROPFIND write error: %v", err)
+			return
+		}
+	}
+	if _, err := w.Write([]byte(`</D:multistatus>`)); err != nil {
+		log.Printf("PROPFIND write error: %v", err)
+	}
 }
 
 // buildPropfindResponse builds the <D:response> XML for one entry.

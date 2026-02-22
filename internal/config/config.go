@@ -179,7 +179,13 @@ func LoadFromFile(path string) (*Config, error) {
 	for _, u := range yc.Users {
 		am := AccessModeFull
 		if u.AccessMode != "" {
-			am, _ = ParseAccessMode(u.AccessMode)
+			parsed, err := ParseAccessMode(u.AccessMode)
+			if err != nil {
+				// Default to Full and continue; unknown values are silently ignored.
+				_ = err
+			} else {
+				am = parsed
+			}
 		}
 		cfg.Users = append(cfg.Users, CustomUser{
 			UserName:   u.UserName,

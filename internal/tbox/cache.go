@@ -32,6 +32,9 @@ func (c *CredCache) Get(userToken string) *SpaceCred {
 	}
 	// Evict 30 s before the token actually expires to avoid races.
 	ttl := time.Duration(e.cred.ExpiresIn)*time.Second - 30*time.Second
+	if ttl <= 0 {
+		ttl = 0
+	}
 	if time.Since(e.fetched) > ttl {
 		return nil
 	}

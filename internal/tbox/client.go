@@ -602,6 +602,8 @@ func (c *Client) DeleteItem(cred *SpaceCred, path string) error {
 	if err != nil {
 		return err
 	}
+	// Drain the body; error is intentionally ignored since we already have
+	// a fallback error from the first DELETE attempt to report.
 	readBody(resp2.Body) //nolint: errcheck
 	if isOK(resp2.StatusCode) || resp2.StatusCode == http.StatusNoContent {
 		return nil
