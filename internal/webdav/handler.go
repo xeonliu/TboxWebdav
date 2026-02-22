@@ -5,7 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -42,36 +42,58 @@ func NewHandler(client *tbox.Client) *Handler {
 	}
 }
 
+// statusRecorder wraps http.ResponseWriter to capture the status code written
+// by the handler so it can be included in the access log.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
 // ServeHTTP dispatches incoming WebDAV requests to the appropriate method handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
 	switch r.Method {
 	case "OPTIONS":
-		h.handleOptions(w, r)
+		h.handleOptions(rec, r)
 	case "HEAD":
-		h.handleHead(w, r)
+		h.handleHead(rec, r)
 	case "GET":
-		h.handleGet(w, r)
+		h.handleGet(rec, r)
 	case "PUT":
-		h.handlePut(w, r)
+		h.handlePut(rec, r)
 	case "DELETE":
-		h.handleDelete(w, r)
+		h.handleDelete(rec, r)
 	case "MKCOL":
-		h.handleMkcol(w, r)
+		h.handleMkcol(rec, r)
 	case "COPY":
-		h.handleCopyMove(w, r, false)
+		h.handleCopyMove(rec, r, false)
 	case "MOVE":
-		h.handleCopyMove(w, r, true)
+		h.handleCopyMove(rec, r, true)
 	case "PROPFIND":
-		h.handlePropfind(w, r)
+		h.handlePropfind(rec, r)
 	case "PROPPATCH":
-		h.handleProppatch(w, r)
+		h.handleProppatch(rec, r)
 	case "LOCK":
-		h.handleLock(w, r)
+		h.handleLock(rec, r)
 	case "UNLOCK":
-		h.handleUnlock(w, r)
+		h.handleUnlock(rec, r)
 	default:
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		http.Error(rec, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
+
+	slog.Info("webdav",
+		"method", r.Method,
+		"path", requestPath(r),
+		"status", rec.status,
+		"duration", time.Since(start).Round(time.Millisecond),
+	)
 }
 
 // --------------------------------------------------------------------------
@@ -84,6 +106,7 @@ func (h *Handler) resolveUserToken(r *http.Request) (string, error) {
 	ctx := r.Context()
 
 	if token, ok := ctx.Value(auth.ContextKeyUserToken).(string); ok && token != "" {
+		slog.Debug("auth: using UserToken from context")
 		return token, nil
 	}
 
@@ -94,14 +117,17 @@ func (h *Handler) resolveUserToken(r *http.Request) (string, error) {
 
 	// Check token cache first.
 	if cached := h.tokenCache.Get(cookie); cached != "" {
+		slog.Debug("auth: userToken cache hit for JaCookie")
 		return cached, nil
 	}
 
 	// Login using JAAuthCookie.
+	slog.Debug("auth: JaCookie login attempt")
 	loginRes, err := h.client.LoginUseJaccount(cookie)
 	if err != nil {
 		return "", fmt.Errorf("jaCookie login failed: %w", err)
 	}
+	slog.Info("auth: JaCookie login succeeded")
 	h.tokenCache.Set(cookie, loginRes.UserToken)
 	return loginRes.UserToken, nil
 }
@@ -109,8 +135,10 @@ func (h *Handler) resolveUserToken(r *http.Request) (string, error) {
 // resolveCred returns a valid SpaceCred for the given userToken, using the cache.
 func (h *Handler) resolveCred(userToken string) (*tbox.SpaceCred, error) {
 	if cached := h.credCache.Get(userToken); cached != nil {
+		slog.Debug("auth: space cred cache hit")
 		return cached, nil
 	}
+	slog.Debug("auth: space cred cache miss, fetching")
 	cred, err := h.client.GetSpace(userToken)
 	if err != nil {
 		return nil, fmt.Errorf("GetSpace failed: %w", err)
@@ -236,12 +264,12 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, headOnly boo
 
 	body, _, err := h.client.GetFileStream(cred, path, rangeStart, rangeEnd)
 	if err != nil {
-		log.Printf("GetFileStream error: %v", err)
+		slog.Error("GET: GetFileStream failed", "path", path, "error", err)
 		return
 	}
 	defer body.Close()
 	if _, err := io.Copy(w, body); err != nil {
-		log.Printf("serveFile copy error: %v", err)
+		slog.Warn("GET: stream copy interrupted", "path", path, "error", err)
 	}
 }
 
@@ -269,6 +297,8 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 	path := requestPath(r)
 	contentLength := r.ContentLength
 
+	slog.Info("PUT: upload started", "path", path, "size", contentLength)
+
 	if contentLength >= 0 && contentLength <= chunkSize {
 		// Small file: use simple upload.
 		err = h.client.SimpleUpload(cred, path, r.Body, contentLength)
@@ -278,10 +308,11 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		log.Printf("PUT %s error: %v", path, err)
+		slog.Error("PUT: upload failed", "path", path, "error", err)
 		http.Error(w, "Upload failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	slog.Info("PUT: upload completed", "path", path)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -313,6 +344,7 @@ func (h *Handler) chunkedUpload(cred *tbox.SpaceCred, path string, body io.Reade
 	if err != nil {
 		return err
 	}
+	slog.Debug("PUT: multipart upload started", "path", path, "chunks", chunkCount, "confirmKey", uploadInfo.ConfirmKey)
 
 	buf := make([]byte, chunkSize)
 	for i := 1; i <= chunkCount; i++ {
@@ -322,6 +354,7 @@ func (h *Handler) chunkedUpload(cred *tbox.SpaceCred, path string, body io.Reade
 			for j := range remaining {
 				remaining[j] = i + j
 			}
+			slog.Debug("PUT: renewing chunk upload credentials", "path", path, "fromPart", i)
 			uploadInfo, err = h.client.RenewChunkUpload(cred, uploadInfo.ConfirmKey, remaining)
 			if err != nil {
 				return err
@@ -338,6 +371,7 @@ func (h *Handler) chunkedUpload(cred *tbox.SpaceCred, path string, body io.Reade
 			return fmt.Errorf("reading chunk %d: %w", i, err)
 		}
 
+		slog.Debug("PUT: uploading chunk", "path", path, "part", i, "of", chunkCount, "bytes", n)
 		if err := h.client.UploadChunk(uploadInfo, bytes.NewReader(buf[:n]), i); err != nil {
 			return fmt.Errorf("chunk %d upload failed: %w", i, err)
 		}
@@ -371,10 +405,11 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	path := requestPath(r)
 	if err := h.client.DeleteItem(cred, path); err != nil {
-		log.Printf("DELETE %s error: %v", path, err)
+		slog.Error("DELETE: failed", "path", path, "error", err)
 		http.Error(w, "Delete failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	slog.Info("DELETE: succeeded", "path", path)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -401,10 +436,11 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) {
 
 	path := requestPath(r)
 	if err := h.client.CreateDirectory(cred, path); err != nil {
-		log.Printf("MKCOL %s error: %v", path, err)
+		slog.Error("MKCOL: failed", "path", path, "error", err)
 		http.Error(w, "MKCOL failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	slog.Info("MKCOL: created", "path", path)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -447,7 +483,11 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, isMove 
 	}
 
 	if err := h.client.CopyOrMoveItem(cred, src, dst, isMove); err != nil {
-		log.Printf("COPY/MOVE %s -> %s error: %v", src, dst, err)
+		op := "COPY"
+		if isMove {
+			op = "MOVE"
+		}
+		slog.Error(op+": failed", "src", src, "dst", dst, "error", err)
 		http.Error(w, "Operation failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -480,8 +520,11 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 	if path == "/" {
 		quota = h.quotaCache.Get(userToken)
 		if quota == nil {
+			slog.Debug("PROPFIND: fetching quota info")
 			q, err := h.client.GetSpaceQuotaInfo(userToken)
-			if err == nil {
+			if err != nil {
+				slog.Warn("PROPFIND: quota fetch failed", "error", err)
+			} else {
 				h.quotaCache.Set(userToken, q)
 				quota = q
 			}
@@ -525,9 +568,10 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 			page := 1
 			const pageSize = 100
 			for {
+				slog.Debug("PROPFIND: listing directory", "path", parentPath, "page", page)
 				list, err := h.client.ListItems(cred, parentPath, page, pageSize)
 				if err != nil {
-					log.Printf("ListItems %s page %d: %v", parentPath, page, err)
+					slog.Error("PROPFIND: ListItems failed", "path", parentPath, "page", page, "error", err)
 					break
 				}
 				for i := range list.Contents {
@@ -552,21 +596,21 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(207)
 
 	if _, err := w.Write([]byte(xml.Header)); err != nil {
-		log.Printf("PROPFIND write error: %v", err)
+		slog.Error("PROPFIND: write error", "error", err)
 		return
 	}
 	if _, err := w.Write([]byte(`<D:multistatus xmlns:D="DAV:">`)); err != nil {
-		log.Printf("PROPFIND write error: %v", err)
+		slog.Error("PROPFIND: write error", "error", err)
 		return
 	}
 	for _, e := range entries {
 		if _, err := w.Write(buildPropfindResponse(e.path, e.item, e.isRoot, quota)); err != nil {
-			log.Printf("PROPFIND write error: %v", err)
+			slog.Error("PROPFIND: write error", "error", err)
 			return
 		}
 	}
 	if _, err := w.Write([]byte(`</D:multistatus>`)); err != nil {
-		log.Printf("PROPFIND write error: %v", err)
+		slog.Error("PROPFIND: write error", "error", err)
 	}
 }
 

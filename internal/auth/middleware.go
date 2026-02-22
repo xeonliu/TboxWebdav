@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/base64"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -34,6 +35,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
+			slog.Warn("auth: None mode but no credentials configured")
 			sendUnauthorized(w)
 			return
 		}
@@ -41,6 +43,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 		// All other modes require a Basic auth header.
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
+			slog.Debug("auth: missing or non-Basic Authorization header")
 			sendUnauthorized(w)
 			return
 		}
@@ -48,6 +51,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 		encoded := strings.TrimSpace(strings.TrimPrefix(authHeader, "Basic "))
 		decoded, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
+			slog.Warn("auth: malformed Base64 in Authorization header", "error", err)
 			sendUnauthorized(w)
 			return
 		}
@@ -55,6 +59,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 		// Split only on the first colon; password may itself contain colons.
 		parts := strings.SplitN(string(decoded), ":", 2)
 		if len(parts) < 2 {
+			slog.Warn("auth: Authorization header missing colon separator")
 			sendUnauthorized(w)
 			return
 		}
@@ -64,6 +69,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 		// UserToken mode / Mixed: accept 128-char hex strings as UserToken.
 		if cfg.AuthMode == config.AuthModeUserToken || cfg.AuthMode == config.AuthModeMixed {
 			if isValidUserToken(password) {
+				slog.Debug("auth: accepted as UserToken", "username", username)
 				ctx := withCreds(r.Context(), password, "", cfg.AccessMode)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
@@ -73,6 +79,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 		// JaCookie mode / Mixed: accept base64-decodable strings as JaCookie.
 		if cfg.AuthMode == config.AuthModeJaCookie || cfg.AuthMode == config.AuthModeMixed {
 			if isValidJaCookie(password) {
+				slog.Debug("auth: accepted as JaCookie", "username", username)
 				ctx := withCreds(r.Context(), "", password, cfg.AccessMode)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
@@ -90,11 +97,13 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 				}
 				// Matched user.
 				if u.UserToken != "" {
+					slog.Debug("auth: accepted custom user via UserToken", "username", username)
 					ctx := withCreds(r.Context(), u.UserToken, "", u.AccessMode)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
 				if u.Cookie != "" {
+					slog.Debug("auth: accepted custom user via JaCookie", "username", username)
 					ctx := withCreds(r.Context(), "", u.Cookie, u.AccessMode)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
@@ -102,6 +111,7 @@ func Middleware(cfg *config.Config, next http.Handler) http.Handler {
 			}
 		}
 
+		slog.Warn("auth: rejected", "username", username, "mode", cfg.AuthMode)
 		sendUnauthorized(w)
 	})
 }

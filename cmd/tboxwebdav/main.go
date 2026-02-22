@@ -2,9 +2,10 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/xeonliu/TboxWebdav/internal/auth"
@@ -25,12 +26,18 @@ func main() {
 		cookie     string
 		token      string
 		accessMode string
+		logLevel   string
 	)
 
 	root := &cobra.Command{
 		Use:   "tboxwebdav",
 		Short: "WebDAV server wrapping the SJTU Tencent Box (SMH) API",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Initialise structured logger.
+			if err := initLogger(logLevel); err != nil {
+				return fmt.Errorf("invalid --log-level %q: %w", logLevel, err)
+			}
+
 			var cfg *config.Config
 
 			if configFile != "" {
@@ -39,6 +46,7 @@ func main() {
 				if err != nil {
 					return fmt.Errorf("failed to load config file: %w", err)
 				}
+				slog.Info("loaded config file", "path", configFile)
 			} else {
 				am, err := config.ParseAuthMode(authMode)
 				if err != nil {
@@ -96,10 +104,31 @@ func main() {
 	root.Flags().StringVarP(&cookie, "cookie", "C", "", "JAAuthCookie for Tbox auth")
 	root.Flags().StringVarP(&token, "token", "T", "", "UserToken for Tbox auth")
 	root.Flags().StringVar(&accessMode, "access", "Full", "Access mode: Full, ReadOnly, NoDelete")
+	root.Flags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// initLogger configures the default slog logger with a text handler at the
+// requested level writing to stderr.
+func initLogger(level string) error {
+	var l slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		l = slog.LevelDebug
+	case "info", "":
+		l = slog.LevelInfo
+	case "warn", "warning":
+		l = slog.LevelWarn
+	case "error":
+		l = slog.LevelError
+	default:
+		return fmt.Errorf("unknown level %q", level)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l})))
+	return nil
 }
 
 func runServer(cfg *config.Config) error {
@@ -110,7 +139,10 @@ func runServer(cfg *config.Config) error {
 	mux.Handle("/", auth.Middleware(cfg, davHandler))
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	fmt.Printf("TboxWebdav server started on http://%s\n", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	slog.Info("TboxWebdav server started", "addr", "http://"+addr, "auth", cfg.AuthMode, "access", cfg.AccessMode)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		slog.Error("server stopped", "error", err)
+		return err
+	}
 	return nil
 }
