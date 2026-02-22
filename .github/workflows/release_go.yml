@@ -1,0 +1,95 @@
+name: Build and Release Go App
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: windows
+            goarch: "386"
+          - goos: freebsd
+            goarch: amd64
+
+    runs-on: ubuntu-latest
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          BINARY_NAME=tboxwebdav
+          if [ "$GOOS" = "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          go build -v -ldflags="-s -w" -o "dist/${BINARY_NAME}" ./cmd/tboxwebdav/
+
+      - name: Package
+        run: |
+          ASSET_NAME=tboxwebdav-${{ matrix.goos }}-${{ matrix.goarch }}
+          mkdir -p /tmp/pkg
+          cp dist/* /tmp/pkg/
+          cd /tmp/pkg
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "/tmp/${ASSET_NAME}.zip" *
+          else
+            tar -czf "/tmp/${ASSET_NAME}.tar.gz" *
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tboxwebdav-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+
+      - name: Upload release asset (zip)
+        if: github.event_name == 'release' && matrix.goos == 'windows'
+        uses: shogo82148/actions-upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: /tmp/tboxwebdav-${{ matrix.goos }}-${{ matrix.goarch }}.zip
+          asset_name: tboxwebdav-${{ matrix.goos }}-${{ matrix.goarch }}.zip
+          asset_content_type: application/zip
+
+      - name: Upload release asset (tar.gz)
+        if: github.event_name == 'release' && matrix.goos != 'windows'
+        uses: shogo82148/actions-upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: /tmp/tboxwebdav-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          asset_name: tboxwebdav-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          asset_content_type: application/gzip
