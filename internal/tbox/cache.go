@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// credExpiryBuffer is the number of seconds before the token expiry at which
+// the cached credential is considered stale and will be refreshed proactively.
+const credExpiryBuffer = 30 * time.Second
+
 // credCacheEntry wraps a SpaceCred with its fetch timestamp.
 type credCacheEntry struct {
 	cred    *SpaceCred
@@ -30,8 +34,8 @@ func (c *CredCache) Get(userToken string) *SpaceCred {
 	if !ok {
 		return nil
 	}
-	// Evict 30 s before the token actually expires to avoid races.
-	ttl := time.Duration(e.cred.ExpiresIn)*time.Second - 30*time.Second
+	// Evict credExpiryBuffer before the token actually expires to avoid races.
+	ttl := time.Duration(e.cred.ExpiresIn)*time.Second - credExpiryBuffer
 	if ttl <= 0 {
 		ttl = 0
 	}

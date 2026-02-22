@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -181,8 +182,7 @@ func LoadFromFile(path string) (*Config, error) {
 		if u.AccessMode != "" {
 			parsed, err := ParseAccessMode(u.AccessMode)
 			if err != nil {
-				// Default to Full and continue; unknown values are silently ignored.
-				_ = err
+				log.Printf("config: unknown AccessMode %q for user %q, defaulting to Full", u.AccessMode, u.UserName)
 			} else {
 				am = parsed
 			}

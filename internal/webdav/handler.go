@@ -286,56 +286,60 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 }
 
 // chunkedUpload uploads a stream in 4 MB chunks using the multipart upload API.
+// When contentLength is known (>= 0), it streams one chunk at a time using at most
+// chunkSize bytes of memory. When contentLength is unknown (-1), it buffers the
+// entire stream before uploading (acceptable since most PUT requests include
+// Content-Length).
 func (h *Handler) chunkedUpload(cred *tbox.SpaceCred, path string, body io.Reader, contentLength int64) error {
-	// Buffer everything so we know the chunk count.
-	// For unknown content-length, buffer each chunk and track count dynamically.
-	var chunks [][]byte
-	buf := make([]byte, chunkSize)
-	for {
-		n, err := io.ReadFull(body, buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			chunks = append(chunks, chunk)
-		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
+	if contentLength < 0 {
+		// Unknown length: buffer everything, then recurse with known length.
+		data, err := io.ReadAll(body)
 		if err != nil {
 			return err
 		}
+		return h.chunkedUpload(cred, path, bytes.NewReader(data), int64(len(data)))
 	}
 
-	if len(chunks) == 0 {
-		// Empty file.
+	if contentLength == 0 {
 		return h.client.SimpleUpload(cred, path, bytes.NewReader(nil), 0)
 	}
 
-	if len(chunks) == 1 {
-		// Single chunk: use simple upload.
-		return h.client.SimpleUpload(cred, path, bytes.NewReader(chunks[0]), int64(len(chunks[0])))
+	chunkCount := int((contentLength + chunkSize - 1) / chunkSize)
+	if chunkCount == 1 {
+		return h.client.SimpleUpload(cred, path, body, contentLength)
 	}
 
-	uploadInfo, err := h.client.StartChunkUpload(cred, path, len(chunks))
+	uploadInfo, err := h.client.StartChunkUpload(cred, path, chunkCount)
 	if err != nil {
 		return err
 	}
 
-	for i, chunk := range chunks {
-		partNumber := i + 1
-		// Renew credentials if this part is missing (e.g., > 50 parts in first batch).
-		if _, ok := uploadInfo.Parts[strconv.Itoa(partNumber)]; !ok {
-			remaining := make([]int, len(chunks)-i)
+	buf := make([]byte, chunkSize)
+	for i := 1; i <= chunkCount; i++ {
+		// Renew credentials if this part token is missing (batches cap at 50).
+		if _, ok := uploadInfo.Parts[strconv.Itoa(i)]; !ok {
+			remaining := make([]int, chunkCount-i+1)
 			for j := range remaining {
-				remaining[j] = i + 1 + j
+				remaining[j] = i + j
 			}
 			uploadInfo, err = h.client.RenewChunkUpload(cred, uploadInfo.ConfirmKey, remaining)
 			if err != nil {
 				return err
 			}
 		}
-		if err := h.client.UploadChunk(uploadInfo, bytes.NewReader(chunk), partNumber); err != nil {
-			return fmt.Errorf("chunk %d upload failed: %w", partNumber, err)
+
+		// Read exactly one chunk into the buffer (avoids holding all chunks in memory).
+		thisChunkSize := int64(chunkSize)
+		if i == chunkCount {
+			thisChunkSize = contentLength - int64(i-1)*chunkSize
+		}
+		n, err := io.ReadFull(body, buf[:thisChunkSize])
+		if err != nil && err != io.ErrUnexpectedEOF {
+			return fmt.Errorf("reading chunk %d: %w", i, err)
+		}
+
+		if err := h.client.UploadChunk(uploadInfo, bytes.NewReader(buf[:n]), i); err != nil {
+			return fmt.Errorf("chunk %d upload failed: %w", i, err)
 		}
 	}
 
