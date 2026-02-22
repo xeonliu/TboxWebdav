@@ -29,17 +29,20 @@ type Handler struct {
 	tokenCache *tbox.TokenCache
 	quotaCache *tbox.QuotaCache
 	dirCache   *tbox.DirCache
+	fileCache  *tbox.FileCache
 	lockSystem webdav.LockSystem
 }
 
 // NewHandler creates a new WebDAV Handler backed by the global caches.
-func NewHandler(client *tbox.Client) *Handler {
+// cacheSize is the total memory budget in bytes for the file content block cache.
+func NewHandler(client *tbox.Client, cacheSize int) *Handler {
 	return &Handler{
 		client:     client,
 		credCache:  tbox.GlobalCredCache,
 		tokenCache: tbox.GlobalTokenCache,
 		quotaCache: tbox.GlobalQuotaCache,
 		dirCache:   tbox.GlobalDirCache,
+		fileCache:  tbox.NewFileCache(cacheSize),
 		lockSystem: webdav.NewMemLS(),
 	}
 }
@@ -292,14 +295,28 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, headOnly boo
 		return
 	}
 
-	body, _, err := h.client.GetFileStream(cred, path, rangeStart, rangeEnd)
-	if err != nil {
-		slog.Error("GET: GetFileStream failed", "path", path, "error", err)
-		return
+	// Determine the byte range to serve.
+	var writeOffset, writeLength int64
+	if isPartial {
+		writeOffset = rangeStart
+		if rangeEnd >= 0 {
+			writeLength = rangeEnd - rangeStart + 1
+		} else {
+			writeLength = fileSize - rangeStart
+		}
+	} else {
+		writeOffset = 0
+		writeLength = fileSize
 	}
-	defer body.Close()
-	if _, err := io.Copy(w, body); err != nil {
-		slog.Warn("GET: stream copy interrupted", "path", path, "error", err)
+
+	opener := func(start, end int64) (io.ReadCloser, error) {
+		// The content-length returned by GetFileStream is not needed here because
+		// WriteTo derives block sizes from totalSize (already known from getItemInfo).
+		body, _, err := h.client.GetFileStream(cred, path, start, end)
+		return body, err
+	}
+	if err := h.fileCache.WriteTo(w, path, fileSize, writeOffset, writeLength, opener); err != nil {
+		slog.Warn("GET: file cache write failed", "path", path, "error", err)
 	}
 }
 
@@ -343,6 +360,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.dirCache.Invalidate(path)
+	h.fileCache.Invalidate(path)
 	slog.Info("PUT: upload completed", "path", path)
 	w.WriteHeader(http.StatusCreated)
 }
@@ -441,6 +459,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.dirCache.Invalidate(path)
+	h.fileCache.Invalidate(path)
 	slog.Info("DELETE: succeeded", "path", path)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -526,6 +545,8 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, isMove 
 	}
 	h.dirCache.Invalidate(src)
 	h.dirCache.Invalidate(dst)
+	h.fileCache.Invalidate(src)
+	h.fileCache.Invalidate(dst)
 	w.WriteHeader(http.StatusCreated)
 }
 

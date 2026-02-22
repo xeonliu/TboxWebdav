@@ -133,7 +133,7 @@ func initLogger(level string) error {
 
 func runServer(cfg *config.Config) error {
 	client := tbox.NewClient()
-	davHandler := davhandler.NewHandler(client)
+	davHandler := davhandler.NewHandler(client, cfg.CacheSize)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", auth.Middleware(cfg, davHandler))
