@@ -82,12 +82,12 @@ func (fs *TboxFs) GetHandle(name string, flags int, offset int64) (ftpserver.Fil
 		return newWriteHandle(fs.client, fs.cred, fs.dirCache, name), nil
 	}
 
-	// Download.
+	// Download: open with a Range request starting at offset.
 	body, _, err := fs.client.GetFileStream(fs.cred, name, offset, -1)
 	if err != nil {
 		return nil, fmt.Errorf("GetHandle read %s: %w", name, err)
 	}
-	return newReadHandle(body), nil
+	return newReadHandle(fs.client, fs.cred, name, body, offset), nil
 }
 
 // --------------------------------------------------------------------------
@@ -305,145 +305,201 @@ func rootFileInfo() os.FileInfo {
 // readHandle – FileTransfer for downloads
 // --------------------------------------------------------------------------
 
-// readHandle wraps an HTTP response body as a FileTransfer (read-only).
-// It buffers the stream into memory on first Seek call to support seeking.
+// readHandle is a FileTransfer for downloading a file.
+// It tracks the current read position and re-issues an HTTP Range request on
+// Seek, so no part of the file is ever fully buffered in memory.
 type readHandle struct {
-	body io.ReadCloser
-	buf  *bytes.Reader // populated lazily on first Seek
+	client *tbox.Client
+	cred   *tbox.SpaceCred
+	name   string
+	body   io.ReadCloser
+	pos    int64
 }
 
-func newReadHandle(body io.ReadCloser) *readHandle {
-	return &readHandle{body: body}
-}
-
-func (h *readHandle) ensureBuffered() error {
-	if h.buf != nil {
-		return nil
-	}
-	data, err := io.ReadAll(h.body)
-	h.body.Close()
-	if err != nil {
-		return err
-	}
-	h.buf = bytes.NewReader(data)
-	return nil
+func newReadHandle(client *tbox.Client, cred *tbox.SpaceCred, name string, body io.ReadCloser, pos int64) *readHandle {
+	return &readHandle{client: client, cred: cred, name: name, body: body, pos: pos}
 }
 
 func (h *readHandle) Read(p []byte) (int, error) {
-	if h.buf != nil {
-		return h.buf.Read(p)
-	}
-	// Stream directly from the body without buffering for sequential reads.
-	return h.body.Read(p)
+	n, err := h.body.Read(p)
+	h.pos += int64(n)
+	return n, err
 }
 
-func (h *readHandle) Write(_ []byte) (int, error) {
-	return 0, errNotSupported
-}
+func (h *readHandle) Write(_ []byte) (int, error) { return 0, errNotSupported }
 
 func (h *readHandle) Seek(offset int64, whence int) (int64, error) {
-	if err := h.ensureBuffered(); err != nil {
-		return 0, err
+	var newPos int64
+	switch whence {
+	case io.SeekStart:
+		newPos = offset
+	case io.SeekCurrent:
+		newPos = h.pos + offset
+	case io.SeekEnd:
+		return 0, fmt.Errorf("seek from end not supported")
+	default:
+		return 0, fmt.Errorf("invalid whence: %d", whence)
 	}
-	return h.buf.Seek(offset, whence)
+	if newPos < 0 {
+		return 0, fmt.Errorf("negative seek position: %d", newPos)
+	}
+	if newPos == h.pos {
+		return h.pos, nil
+	}
+	// Re-open the stream at the new position via an HTTP Range request.
+	h.body.Close()
+	body, _, err := h.client.GetFileStream(h.cred, h.name, newPos, -1)
+	if err != nil {
+		return 0, fmt.Errorf("seek to %d: %w", newPos, err)
+	}
+	h.body = body
+	h.pos = newPos
+	return newPos, nil
 }
 
-func (h *readHandle) Close() error {
-	if h.buf != nil {
-		return nil // body already closed in ensureBuffered
-	}
-	return h.body.Close()
-}
+func (h *readHandle) Close() error { return h.body.Close() }
 
 // --------------------------------------------------------------------------
 // writeHandle – FileTransfer for uploads
 // --------------------------------------------------------------------------
 
-// writeHandle buffers all written bytes and uploads them to Tbox on Close.
+// writeHandle is a FileTransfer for uploading a file.
+// Data is piped through an io.Pipe to a background goroutine that uploads it
+// to Tbox in 4 MB chunks – no full-file buffering in memory.
 type writeHandle struct {
-	client   *tbox.Client
-	cred     *tbox.SpaceCred
-	dirCache *tbox.DirCache
-	name     string
-	buf      bytes.Buffer
-	closed   bool
+	pw     *io.PipeWriter
+	done   chan error
+	closed bool
 }
 
-const ftpChunkSize = 4 * 1024 * 1024 // 4 MB
+const ftpChunkSize = 4 * 1024 * 1024 // 4 MB chunk size for multipart uploads
+const ftpPartBatch  = 50              // presigned URL batch size per API call
 
 func newWriteHandle(client *tbox.Client, cred *tbox.SpaceCred, dirCache *tbox.DirCache, name string) *writeHandle {
-	return &writeHandle{client: client, cred: cred, dirCache: dirCache, name: name}
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		err := streamUpload(client, cred, dirCache, name, pr)
+		if err != nil {
+			pr.CloseWithError(err) // propagates error to any pending Write
+		} else {
+			pr.Close()
+		}
+		done <- err
+	}()
+	return &writeHandle{pw: pw, done: done}
 }
 
-func (h *writeHandle) Read(_ []byte) (int, error) {
-	return 0, errNotSupported
-}
-
-func (h *writeHandle) Write(p []byte) (int, error) {
-	return h.buf.Write(p)
-}
-
-func (h *writeHandle) Seek(_ int64, _ int) (int64, error) {
-	return 0, errNotSupported
-}
+func (h *writeHandle) Read(_ []byte) (int, error)        { return 0, errNotSupported }
+func (h *writeHandle) Write(p []byte) (int, error)        { return h.pw.Write(p) }
+func (h *writeHandle) Seek(_ int64, _ int) (int64, error) { return 0, errNotSupported }
 
 func (h *writeHandle) Close() error {
 	if h.closed {
 		return nil
 	}
 	h.closed = true
-
-	data := h.buf.Bytes()
-	size := int64(len(data))
-
-	var uploadErr error
-	if size <= ftpChunkSize {
-		uploadErr = h.client.SimpleUpload(h.cred, h.name, bytes.NewReader(data), size)
-	} else {
-		uploadErr = chunkedUpload(h.client, h.cred, h.name, bytes.NewReader(data), size)
-	}
-	if uploadErr != nil {
-		return fmt.Errorf("upload %s: %w", h.name, uploadErr)
-	}
-	h.dirCache.Invalidate(h.name)
-	return nil
+	h.pw.Close() // signals EOF to the upload goroutine
+	return <-h.done
 }
 
-// chunkedUpload uploads data in ftpChunkSize chunks using the multipart upload API.
-func chunkedUpload(client *tbox.Client, cred *tbox.SpaceCred, path string, data io.ReadSeeker, size int64) error {
-	chunkCount := int((size + ftpChunkSize - 1) / ftpChunkSize)
-	uploadInfo, err := client.StartChunkUpload(cred, path, chunkCount)
+// TransferError implements ftpserver.FileTransferError.
+// Called by ftpserverlib when a data-connection error occurs so we can abort
+// the background upload instead of waiting for a normal Close.
+func (h *writeHandle) TransferError(err error) {
+	if h.closed {
+		return
+	}
+	h.closed = true
+	h.pw.CloseWithError(err)
+	// Non-blocking drain: the done channel is buffered (size 1); if the
+	// goroutine has already finished it will have sent, so we collect it now.
+	// If it hasn't, the send will land in the buffer and be GC'd with the handle.
+	select {
+	case <-h.done:
+	default:
+	}
+}
+
+// isReadEOF returns true when err signals end-of-stream from io.ReadFull.
+func isReadEOF(err error) bool {
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
+}
+
+// streamUpload reads from r in 4 MB chunks and uploads to Tbox.
+// Files that fit in one chunk use SimpleUpload; larger files use the multipart
+// upload API, requesting presigned URLs in batches of ftpPartBatch.
+func streamUpload(client *tbox.Client, cred *tbox.SpaceCred, dirCache *tbox.DirCache, name string, r io.Reader) error {
+	buf := make([]byte, ftpChunkSize)
+
+	// Read the first chunk.
+	n, err := io.ReadFull(r, buf)
+	if err != nil && !isReadEOF(err) {
+		return err
+	}
+
+	if isReadEOF(err) {
+		// Entire file fits in one chunk; use simple upload.
+		uploadErr := client.SimpleUpload(cred, name, bytes.NewReader(buf[:n]), int64(n))
+		if uploadErr == nil {
+			dirCache.Invalidate(name)
+		}
+		return uploadErr
+	}
+
+	// Multi-chunk upload. Request the first batch of presigned part URLs.
+	uploadInfo, err := client.StartChunkUpload(cred, name, ftpPartBatch)
 	if err != nil {
 		return err
 	}
 
-	buf := make([]byte, ftpChunkSize)
-	for i := 1; i <= chunkCount; i++ {
-		if _, ok := uploadInfo.Parts[strconv.Itoa(i)]; !ok {
-			remaining := make([]int, chunkCount-i+1)
-			for j := range remaining {
-				remaining[j] = i + j
+	partNum := 1
+	for {
+		// Ensure we have a presigned URL for this part number.
+		if _, ok := uploadInfo.Parts[strconv.Itoa(partNum)]; !ok {
+			batch := make([]int, ftpPartBatch)
+			for i := range batch {
+				batch[i] = partNum + i
 			}
-			uploadInfo, err = client.RenewChunkUpload(cred, uploadInfo.ConfirmKey, remaining)
+			uploadInfo, err = client.RenewChunkUpload(cred, uploadInfo.ConfirmKey, batch)
 			if err != nil {
 				return err
 			}
 		}
 
-		thisChunkSize := int64(ftpChunkSize)
-		if i == chunkCount {
-			thisChunkSize = size - int64(i-1)*ftpChunkSize
+		if uploadErr := client.UploadChunk(uploadInfo, bytes.NewReader(buf[:n]), partNum); uploadErr != nil {
+			return fmt.Errorf("chunk %d upload failed: %w", partNum, uploadErr)
 		}
-		n, readErr := io.ReadFull(data, buf[:thisChunkSize])
-		if readErr != nil && readErr != io.ErrUnexpectedEOF {
-			return fmt.Errorf("reading chunk %d: %w", i, readErr)
+
+		// Read the next chunk.
+		n, err = io.ReadFull(r, buf)
+		if err != nil && !isReadEOF(err) {
+			return fmt.Errorf("reading after chunk %d: %w", partNum, err)
 		}
-		if err := client.UploadChunk(uploadInfo, bytes.NewReader(buf[:n]), i); err != nil {
-			return fmt.Errorf("chunk %d upload failed: %w", i, err)
+
+		if isReadEOF(err) {
+			if n > 0 {
+				// Upload the final partial chunk.
+				partNum++
+				if _, ok := uploadInfo.Parts[strconv.Itoa(partNum)]; !ok {
+					uploadInfo, err = client.RenewChunkUpload(cred, uploadInfo.ConfirmKey, []int{partNum})
+					if err != nil {
+						return err
+					}
+				}
+				if uploadErr := client.UploadChunk(uploadInfo, bytes.NewReader(buf[:n]), partNum); uploadErr != nil {
+					return fmt.Errorf("final chunk upload failed: %w", uploadErr)
+				}
+			}
+			break
 		}
+		partNum++
 	}
 
 	_, err = client.ConfirmUpload(cred, uploadInfo.ConfirmKey)
+	if err == nil {
+		dirCache.Invalidate(name)
+	}
 	return err
 }
 
