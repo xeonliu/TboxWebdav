@@ -1,6 +1,38 @@
 package tbox
 
-import "time"
+import (
+	"encoding/json"
+	"strconv"
+	"time"
+)
+
+// FlexInt64 is an int64 that accepts both JSON numbers and JSON strings.
+// The Tencent Box API inconsistently returns versionId as either type.
+type FlexInt64 int64
+
+func (f *FlexInt64) UnmarshalJSON(data []byte) error {
+	// Try number first.
+	var n int64
+	if err := json.Unmarshal(data, &n); err == nil {
+		*f = FlexInt64(n)
+		return nil
+	}
+	// Try quoted string.
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return err
+	}
+	*f = FlexInt64(n)
+	return nil
+}
 
 // SpaceCred holds the access token and space identifiers returned by the space API.
 type SpaceCred struct {
@@ -31,7 +63,7 @@ type FileInfo struct {
 	Path             []string    `json:"path"`
 	Size             string      `json:"size"`
 	Type             string      `json:"type"`
-	VersionId        int64       `json:"versionId"`
+	VersionId        *FlexInt64  `json:"versionId"`
 }
 
 // FolderInfo holds metadata for a directory.
@@ -56,7 +88,7 @@ type MergedItemDto struct {
 	Path             []string    `json:"path"`
 	Size             string      `json:"size"`
 	Type             string      `json:"type"`
-	VersionId        *int64      `json:"versionId"`
+	VersionId        *FlexInt64  `json:"versionId"`
 }
 
 // ItemListDto holds a paginated directory listing.
