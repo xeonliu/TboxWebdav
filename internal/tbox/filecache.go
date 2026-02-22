@@ -100,11 +100,24 @@ func (c *FileCache) Invalidate(filePath string) {
 	}
 }
 
+// readChunkSize is the size of each read from the backend stream.
+// Smaller values reduce latency to first byte; 32 KiB is a good default.
+const readChunkSize = 32 * 1024
+
 // WriteTo writes bytes [offset, offset+length) of filePath to w.
-// Cached blocks are served directly; missing blocks are fetched via opener and
-// then stored in the cache. Sequential reads reuse a single open HTTP stream
-// across consecutive cache misses to avoid redundant connections.
-// opener is called with (blockStart, -1) to fetch from blockStart to EOF.
+//
+// Cache hits are served directly from memory.
+//
+// On a cache miss the block is fetched from the backend via opener. Bytes are
+// forwarded to w in readChunkSize increments as they arrive, so the client
+// starts receiving data immediately instead of waiting for the full block.
+// If w returns a write error (e.g. "broken pipe" when a media player closes
+// the connection early) we keep reading from the backend until the block is
+// complete so that the completed block can be cached.  The next (immediate)
+// retry from the client is then served from cache with no backend round-trip.
+//
+// Sequential reads reuse a single open HTTP stream across consecutive cache
+// misses to avoid redundant connections.
 func (c *FileCache) WriteTo(w io.Writer, filePath string, totalSize, offset, length int64, opener FileStreamOpener) error {
 	if length <= 0 || offset >= totalSize {
 		return nil
@@ -136,12 +149,31 @@ func (c *FileCache) WriteTo(w io.Writer, filePath string, totalSize, offset, len
 		}
 		blockLen := int(blockEnd - blockStart)
 
+		// How many bytes of this block the current request needs.
+		toCopy := int(remaining)
+		if toCopy > blockLen-blockOff {
+			toCopy = blockLen - blockOff
+		}
+
 		c.mu.Lock()
 		data := c.getBlock(filePath, blockNum)
 		c.mu.Unlock()
 
-		if data == nil {
+		if data != nil {
+			slog.Debug("filecache: hit", "file", filePath, "block", blockNum)
+			// Cache hit: close any open backend stream (it is no longer at the
+			// right position for the block that follows).
+			if stream != nil {
+				stream.Close()
+				stream = nil
+				streamAt = -1
+			}
+			if _, err := w.Write(data[blockOff : blockOff+toCopy]); err != nil {
+				return err
+			}
+		} else {
 			slog.Debug("filecache: miss", "file", filePath, "block", blockNum)
+
 			// Open or reuse an HTTP stream positioned at blockStart.
 			if streamAt != blockStart {
 				if stream != nil {
@@ -156,53 +188,81 @@ func (c *FileCache) WriteTo(w io.Writer, filePath string, totalSize, offset, len
 				streamAt = blockStart
 			}
 
-			data = make([]byte, blockLen)
-			n, err := io.ReadFull(stream, data)
-			if err == io.ErrUnexpectedEOF {
-				// Backend returned fewer bytes than expected (truncated response or
-				// dropped connection). Do not cache the partial block so that a
-				// subsequent request will re-fetch clean data from the server.
-				data = data[:n]
-				stream.Close()
-				stream = nil
-				streamAt = -1
-				slog.Warn("filecache: partial block read, not caching", "file", filePath, "block", blockNum, "got", n, "want", blockLen)
-			} else if err != nil {
-				stream.Close()
-				stream = nil
-				streamAt = -1
-				return fmt.Errorf("filecache: read block %d: %w", blockNum, err)
-			} else {
-				streamAt = blockEnd
-				// Only cache complete blocks to ensure data consistency.
-				c.mu.Lock()
-				c.putBlock(filePath, blockNum, data)
-				c.mu.Unlock()
+			// Read the block in small chunks, writing to the client as bytes
+			// arrive so the client is not blocked waiting for the full block.
+			// clientErr records any write failure but does NOT abort the read —
+			// we finish the block so it can be cached for the immediate retry.
+			blockBuf := make([]byte, blockLen)
+			totalRead := 0
+			var clientErr error
+			clientEnd := blockOff + toCopy // exclusive upper bound within the block
+			tmp := make([]byte, readChunkSize)
+
+			for totalRead < blockLen {
+				want := blockLen - totalRead
+				if want > readChunkSize {
+					want = readChunkSize
+				}
+				n, readErr := stream.Read(tmp[:want])
+				if n > 0 {
+					// Accumulate into blockBuf for caching.
+					copy(blockBuf[totalRead:], tmp[:n])
+
+					// Write directly from tmp the bytes that fall within the
+					// client's requested range [blockOff, clientEnd).
+					chunkStart := 0
+					if totalRead < blockOff {
+						chunkStart = blockOff - totalRead
+					}
+					chunkEnd := n
+					if totalRead+n > clientEnd {
+						chunkEnd = clientEnd - totalRead
+					}
+					if chunkStart < chunkEnd && clientErr == nil {
+						if _, err := w.Write(tmp[chunkStart:chunkEnd]); err != nil {
+							// Record the error but continue reading so we can
+							// complete and cache the block.
+							clientErr = err
+						}
+					}
+
+					totalRead += n
+				}
+				if readErr == io.EOF {
+					break
+				}
+				if readErr != nil {
+					stream.Close()
+					stream = nil
+					streamAt = -1
+					return fmt.Errorf("filecache: read block %d: %w", blockNum, readErr)
+				}
 			}
-		} else {
-			slog.Debug("filecache: hit", "file", filePath, "block", blockNum)
-			// Cache hit: the open stream (if any) is no longer at the right position
-			// for the block after this one, so close it to free the connection.
-			if stream != nil {
+
+			if totalRead == blockLen {
+				// Complete block: cache it and mark the stream as advanced.
+				c.mu.Lock()
+				c.putBlock(filePath, blockNum, blockBuf)
+				c.mu.Unlock()
+				streamAt = blockEnd
+			} else {
+				// Partial block (backend returned less data than expected).
+				// Do not cache so the next request re-fetches clean data.
+				slog.Warn("filecache: partial block read, not caching",
+					"file", filePath, "block", blockNum,
+					"got", totalRead, "want", blockLen)
 				stream.Close()
 				stream = nil
 				streamAt = -1
+			}
+
+			if clientErr != nil {
+				return clientErr
 			}
 		}
 
-		available := len(data) - blockOff
-		if available <= 0 {
-			break
-		}
-		toCopy := remaining
-		if toCopy > int64(available) {
-			toCopy = int64(available)
-		}
-		if _, err := w.Write(data[blockOff : blockOff+int(toCopy)]); err != nil {
-			return err
-		}
-		pos += toCopy
-		remaining -= toCopy
+		pos += int64(toCopy)
+		remaining -= int64(toCopy)
 	}
 	return nil
 }
