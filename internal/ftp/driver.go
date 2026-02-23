@@ -32,7 +32,7 @@ func NewDriver(client *tbox.Client, cfg *config.Config) *Driver {
 // GetSettings returns the FTP server settings derived from cfg.
 func (d *Driver) GetSettings() (*ftpserver.Settings, error) {
 	s := &ftpserver.Settings{
-		ListenAddr:        fmt.Sprintf("%s:%d", d.cfg.Host, d.cfg.FTPPort),
+		ListenAddr:             fmt.Sprintf("%s:%d", d.cfg.Host, d.cfg.FTPPort),
 		ActiveConnectionsCheck: ftpserver.IPMatchDisabled,
 		PasvConnectionsCheck:   ftpserver.IPMatchDisabled,
 	}
@@ -93,7 +93,6 @@ func (d *Driver) AuthUser(cc ftpserver.ClientContext, user, pass string) (ftpser
 		return nil, fmt.Errorf("authentication failed")
 	}
 
-	slog.Info("ftp: user authenticated", "user", user, "access", am)
 	return NewTboxFs(d.client, cred, tbox.GlobalDirCache, am), nil
 }
 
