@@ -205,6 +205,53 @@ func mimeType(name string) string {
 	return "application/octet-stream"
 }
 
+// tboxErrorCode extracts a bracketed backend error code, for example
+// "[FileNotFound] ..." -> "FileNotFound".
+func tboxErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	start := strings.IndexByte(s, '[')
+	if start < 0 {
+		return ""
+	}
+	end := strings.IndexByte(s[start+1:], ']')
+	if end < 0 {
+		return ""
+	}
+	code := s[start+1 : start+1+end]
+	if code == "" {
+		return ""
+	}
+	return code
+}
+
+func mkcolStatusFromError(err error) int {
+	switch tboxErrorCode(err) {
+	case "SameNameDirectoryOrFileExists":
+		// MKCOL on an existing resource should not be a server error.
+		return http.StatusMethodNotAllowed
+	case "ParentNotFound", "ParentDirectoryNotFound":
+		return http.StatusConflict
+	case "NoPermission", "AccessDenied":
+		return http.StatusForbidden
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func deleteStatusFromError(err error) int {
+	switch tboxErrorCode(err) {
+	case "FileNotFound", "DirectoryNotFound", "NotFound":
+		return http.StatusNotFound
+	case "NoPermission", "AccessDenied":
+		return http.StatusForbidden
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 // --------------------------------------------------------------------------
 // OPTIONS
 // --------------------------------------------------------------------------
@@ -436,8 +483,14 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	path := requestPath(r)
 	if err := h.client.DeleteItem(cred, path); err != nil {
-		slog.Error("DELETE: failed", "path", path, "error", err)
-		http.Error(w, "Delete failed: "+err.Error(), http.StatusInternalServerError)
+		status := deleteStatusFromError(err)
+		if status == http.StatusInternalServerError {
+			slog.Error("DELETE: failed", "path", path, "error", err)
+			http.Error(w, "Delete failed: "+err.Error(), status)
+		} else {
+			slog.Warn("DELETE: expected failure", "path", path, "status", status, "error", err)
+			http.Error(w, http.StatusText(status), status)
+		}
 		return
 	}
 	h.dirCache.Invalidate(path)
@@ -468,8 +521,14 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) {
 
 	path := requestPath(r)
 	if err := h.client.CreateDirectory(cred, path); err != nil {
-		slog.Error("MKCOL: failed", "path", path, "error", err)
-		http.Error(w, "MKCOL failed: "+err.Error(), http.StatusInternalServerError)
+		status := mkcolStatusFromError(err)
+		if status == http.StatusInternalServerError {
+			slog.Error("MKCOL: failed", "path", path, "error", err)
+			http.Error(w, "MKCOL failed: "+err.Error(), status)
+		} else {
+			slog.Warn("MKCOL: expected failure", "path", path, "status", status, "error", err)
+			http.Error(w, http.StatusText(status), status)
+		}
 		return
 	}
 	h.dirCache.Invalidate(path)
@@ -567,8 +626,8 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type propfindEntry struct {
-		path string
-		item *tbox.MergedItemDto
+		path   string
+		item   *tbox.MergedItemDto
 		isRoot bool
 	}
 
