@@ -110,6 +110,13 @@ type Config struct {
 	Cookie     string
 	UserToken  string
 	Users      []CustomUser
+
+	// FTP-specific settings.
+	FTPEnabled          bool
+	FTPPort             int
+	FTPPassiveHost      string
+	FTPPassivePortStart int
+	FTPPassivePortEnd   int
 }
 
 // yamlRoot mirrors the YAML file structure.
@@ -122,6 +129,13 @@ type yamlRoot struct {
 	Cookie     string     `yaml:"Cookie"`
 	UserToken  string     `yaml:"UserToken"`
 	Users      []yamlUser `yaml:"Users"`
+
+	// FTP-specific settings.
+	FTPEnabled          bool   `yaml:"FTPEnabled"`
+	FTPPort             int    `yaml:"FTPPort"`
+	FTPPassiveHost      string `yaml:"FTPPassiveHost"`
+	FTPPassivePortStart int    `yaml:"FTPPassivePortStart"`
+	FTPPassivePortEnd   int    `yaml:"FTPPassivePortEnd"`
 }
 
 type yamlUser struct {
@@ -176,6 +190,14 @@ func LoadFromFile(path string) (*Config, error) {
 	}
 	cfg.Cookie = yc.Cookie
 	cfg.UserToken = yc.UserToken
+
+	cfg.FTPEnabled = yc.FTPEnabled
+	if yc.FTPPort != 0 {
+		cfg.FTPPort = yc.FTPPort
+	}
+	cfg.FTPPassiveHost = yc.FTPPassiveHost
+	cfg.FTPPassivePortStart = yc.FTPPassivePortStart
+	cfg.FTPPassivePortEnd = yc.FTPPassivePortEnd
 
 	for _, u := range yc.Users {
 		am := AccessModeFull
